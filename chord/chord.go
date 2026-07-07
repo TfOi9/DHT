@@ -224,17 +224,136 @@ func (node *ChordNode) Run(wg *sync.WaitGroup) {
 
 // stabilize checks the node's successor and updates its predecessor and successor list accordingly
 func (node *ChordNode) stabilize() {
-	// TBD
+	node.mu.Lock()
+	succ := node.successorList[0]
+	node.mu.Unlock()
+
+	// Nothing to stabilize — self is the only node in the ring.
+	if succ == "" || succ == node.Addr {
+		return
+	}
+
+	// Check whether the successor is still alive.
+	err := node.RemoteCall(succ, "ChordNode.Ping", "", &struct{}{})
+	if err != nil {
+		// Successor has failed — shift successorList and retry next round.
+		node.mu.Lock()
+		for i := 0; i < successorListSize-1; i++ {
+			node.successorList[i] = node.successorList[i+1]
+		}
+		node.successorList[successorListSize-1] = ""
+		node.mu.Unlock()
+		logrus.Warnf("[%s] Successor %s is dead, shifted successorList", node.Addr, succ)
+		return
+	}
+
+	// Ask the successor for its predecessor.
+	var x string
+	err = node.RemoteCall(succ, "ChordNode.GetPredecessor", "", &x)
+	if err != nil {
+		return // retry next round
+	}
+
+	// If x is a better successor (in (n, successor)), adopt it.
+	if x != "" && x != node.Addr && inRange(toID(x), node.ID, toID(succ)) {
+		node.mu.Lock()
+		node.successorList[0] = x
+		node.mu.Unlock()
+		succ = x // notify the new successor
+		logrus.Infof("[%s] Found closer successor: %s", node.Addr, x)
+	}
+
+	// Tell the (possibly updated) successor about our existence.
+	node.RemoteCall(succ, "ChordNode.Notify", node.Addr, &struct{}{})
 }
 
-// fixFingers updates the node's finger table entries to ensure efficient lookups
+// fixFingers updates the node's finger table entries to ensure efficient lookups.
+// Following the Chord paper §4.4: each invocation refreshes a randomly chosen
+// finger entry to avoid thundering-herd effects when many nodes join simultaneously.
 func (node *ChordNode) fixFingers() {
-	// TBD
+	// Randomly pick a finger entry to refresh (Chord paper: "randomly chosen").
+	node.mu.Lock()
+	i := node.randGenerator.Intn(fingerTableSize)
+	node.mu.Unlock()
+
+	// Compute the target ID for this finger: n + 2^i  (mod 2^32 via uint32 overflow).
+	fingerID := node.ID + (1 << i)
+	addr := node.findSuccessor(fingerID)
+
+	node.mu.Lock()
+	node.fingerTable[i] = addr
+	node.mu.Unlock()
+
+	// Also refresh the successor list from the current successor.
+	node.mu.Lock()
+	succ := node.successorList[0]
+	node.mu.Unlock()
+
+	if succ == "" || succ == node.Addr {
+		return
+	}
+
+	var remoteList [successorListSize]string
+	err := node.RemoteCall(succ, "ChordNode.GetSuccessorList", "", &remoteList)
+	if err != nil {
+		return
+	}
+
+	node.mu.Lock()
+	// Keep [0]=succ, fill [1..] from remote entries (dedup self and succ).
+	idx := 1
+	for j := 0; j < successorListSize && idx < successorListSize; j++ {
+		if remoteList[j] != "" && remoteList[j] != succ && remoteList[j] != node.Addr {
+			node.successorList[idx] = remoteList[j]
+			idx++
+		}
+	}
+	for j := idx; j < successorListSize; j++ {
+		node.successorList[j] = ""
+	}
+	node.mu.Unlock()
 }
 
-// checkPredecessor checks if the node's predecessor is still alive and updates it if necessary
+// Notify is called by a node that thinks it might be our predecessor.
+// Following the Chord paper: update predecessor only if it is nil or
+// the notifying node lies in (predecessor, self).
+func (node *ChordNode) Notify(args string, _ *struct{}) error {
+	node.mu.Lock()
+	defer node.mu.Unlock()
+
+	// Ignore self-notifications.
+	if args == node.Addr {
+		return nil
+	}
+
+	if node.predecessor == "" || inRange(toID(args), toID(node.predecessor), node.ID) {
+		node.predecessor = args
+		logrus.Infof("[%s] Updated predecessor to %s", node.Addr, args)
+	}
+	return nil
+}
+
+// checkPredecessor checks if the node's predecessor is still alive.
+// Following the Chord paper: if the predecessor has failed, clear it.
 func (node *ChordNode) checkPredecessor() {
-	// TBD
+	node.mu.Lock()
+	pred := node.predecessor
+	node.mu.Unlock()
+
+	if pred == "" || pred == node.Addr {
+		return
+	}
+
+	err := node.RemoteCall(pred, "ChordNode.Ping", "", &struct{}{})
+	if err != nil {
+		node.mu.Lock()
+		// Only clear if the predecessor hasn't been concurrently updated.
+		if node.predecessor == pred {
+			node.predecessor = ""
+			logrus.Warnf("[%s] Predecessor %s is dead, cleared", node.Addr, pred)
+		}
+		node.mu.Unlock()
+	}
 }
 
 // initialize a new Chord ring with the current node as the only member
@@ -366,4 +485,83 @@ func (node *ChordNode) Join(addr string) bool {
 
 	logrus.Infof("[%s] Joined the Chord ring via %s, successor: %s", node.Addr, addr, succAddr)
 	return true
+}
+
+func (node *ChordNode) Quit() {
+	node.mu.Lock()
+	if !node.isActive {
+		node.mu.Unlock()
+		return
+	}
+
+	logrus.Infof("[%s] Quitting the Chord ring", node.Addr)
+
+	succ := node.successorList[0]
+	node.isActive = false
+	node.mu.Unlock()
+
+	// Move all local data to the successor (best-effort).
+	if succ != "" && succ != node.Addr {
+		node.dataLock.RLock()
+		allData := node.data
+		node.dataLock.RUnlock()
+
+		for k, v := range allData {
+			var dummy struct{}
+			err := node.RemoteCall(succ, "ChordNode.PutData", Pair{Key: k, Value: v}, &dummy)
+			if err != nil {
+				logrus.Errorf("[%s] Failed to transfer key %s to successor %s: %v", node.Addr, k, succ, err)
+			}
+		}
+	}
+
+	// Chord ring self-heals via stabilize; no explicit successor/predecessor
+	// notification is required by the paper.
+
+	node.StopRPCServer()
+	logrus.Infof("[%s] Successfully quit the Chord ring", node.Addr)
+}
+
+// UpdateSuccessor inserts newSucc as the direct successor, shifting the
+// existing successorList entries right. Duplicates and self are excluded.
+func (node *ChordNode) UpdateSuccessor(newSucc string, _ *struct{}) error {
+	node.mu.Lock()
+	defer node.mu.Unlock()
+
+	if newSucc == "" || newSucc == node.Addr {
+		return nil
+	}
+
+	// Remove newSucc from any existing position in the list (dedup).
+	for i := 0; i < successorListSize; i++ {
+		if node.successorList[i] == newSucc {
+			// Shift remaining entries left.
+			for j := i; j < successorListSize-1; j++ {
+				node.successorList[j] = node.successorList[j+1]
+			}
+			node.successorList[successorListSize-1] = ""
+			break
+		}
+	}
+
+	// Shift right to make room at [0].
+	for i := successorListSize - 1; i > 0; i-- {
+		node.successorList[i] = node.successorList[i-1]
+	}
+	node.successorList[0] = newSucc
+	return nil
+}
+
+// UpdatePredecessor sets the predecessor to newPred.
+// This is a best-effort utility; Chord's standard Notify RPC (with
+// range-based validation) is preferred for ring convergence.
+func (node *ChordNode) UpdatePredecessor(newPred string, _ *struct{}) error {
+	node.mu.Lock()
+	defer node.mu.Unlock()
+
+	if newPred == "" || newPred == node.Addr {
+		return nil
+	}
+	node.predecessor = newPred
+	return nil
 }
