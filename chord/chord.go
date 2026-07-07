@@ -49,6 +49,12 @@ type Pair struct {
 	Value string
 }
 
+// Range describes a half-open interval on the Chord ring: (Start, End].
+type Range struct {
+	Start uint32 // exclusive lower bound
+	End   uint32 // inclusive upper bound
+}
+
 // toID converts a string key to a uint32 ID using the FNV-1a hash function.
 func toID(key string) uint32 {
 	h := fnv.New32a()
@@ -152,6 +158,22 @@ func (node *ChordNode) DeleteData(key string, _ *struct{}) error {
 	return nil
 }
 
+// TransferKeys returns (and deletes locally) all key-value pairs whose hashed
+// key falls within the half-open interval (r.Start, r.End] on the Chord ring.
+func (node *ChordNode) TransferKeys(r Range, reply *map[string]string) error {
+	result := make(map[string]string)
+	node.dataLock.Lock()
+	for k, v := range node.data {
+		if inRange(toID(k), r.Start, r.End) {
+			result[k] = v
+			delete(node.data, k)
+		}
+	}
+	node.dataLock.Unlock()
+	*reply = result
+	return nil
+}
+
 // empty function to check if a node is online
 func (node *ChordNode) Ping(_ string, _ *struct{}) error {
 	return nil
@@ -177,10 +199,20 @@ func (node *ChordNode) RemoteCall(addr, method string, args interface{}, reply i
 	return nil
 }
 
-// StopRPCServer stops the RPC server for the Chord node
+// StopRPCServer stops the RPC server for the Chord node.
+// Safe to call multiple times; uses sync.Once internally.
 func (node *ChordNode) StopRPCServer() {
+	node.mu.Lock()
+	if !node.online {
+		node.mu.Unlock()
+		return
+	}
 	node.online = false
-	node.listener.Close()
+	node.mu.Unlock()
+
+	if node.listener != nil {
+		node.listener.Close()
+	}
 	close(node.shutdown)
 }
 
@@ -265,23 +297,38 @@ func (node *ChordNode) stabilize() {
 	succ := node.successorList[0]
 	node.mu.Unlock()
 
-	// Nothing to stabilize — self is the only node in the ring.
-	if succ == "" || succ == node.Addr {
+	// Not part of any ring yet — nothing to stabilize.
+	if succ == "" {
 		return
 	}
 
-	// Check whether the successor is still alive.
+	// Check whether the successor is still alive; if not, scan the
+	// successor list for the first live entry.
 	err := node.RemoteCall(succ, "ChordNode.Ping", "", &struct{}{})
 	if err != nil {
-		// Successor has failed — shift successorList and retry next round.
 		node.mu.Lock()
-		for i := 0; i < successorListSize-1; i++ {
-			node.successorList[i] = node.successorList[i+1]
+		// Shift out dead entries until we find a live successor (or exhaust the list).
+		for {
+			if node.successorList[0] == "" || node.successorList[0] == node.Addr {
+				break
+			}
+			node.mu.Unlock()
+			err2 := node.RemoteCall(node.successorList[0], "ChordNode.Ping", "", &struct{}{})
+			node.mu.Lock()
+			if err2 == nil {
+				break // found live successor
+			}
+			logrus.Warnf("[%s] Successor %s is dead, shifting successorList", node.Addr, node.successorList[0])
+			for i := 0; i < successorListSize-1; i++ {
+				node.successorList[i] = node.successorList[i+1]
+			}
+			node.successorList[successorListSize-1] = ""
 		}
-		node.successorList[successorListSize-1] = ""
+		succ = node.successorList[0]
 		node.mu.Unlock()
-		logrus.Warnf("[%s] Successor %s is dead, shifted successorList", node.Addr, succ)
-		return
+		if succ == "" || succ == node.Addr {
+			return
+		}
 	}
 
 	// Ask the successor for its predecessor.
@@ -354,18 +401,63 @@ func (node *ChordNode) fixFingers() {
 // Notify is called by a node that thinks it might be our predecessor.
 // Following the Chord paper: update predecessor only if it is nil or
 // the notifying node lies in (predecessor, self).
+// When predecessor transitions from empty to non-empty for the first time,
+// precise key migration is triggered to correct any over/under-pull from Join.
 func (node *ChordNode) Notify(args string, _ *struct{}) error {
 	node.mu.Lock()
-	defer node.mu.Unlock()
 
 	// Ignore self-notifications.
 	if args == node.Addr {
+		node.mu.Unlock()
 		return nil
 	}
 
-	if node.predecessor == "" || inRange(toID(args), toID(node.predecessor), node.ID) {
+	oldPred := node.predecessor
+	shouldUpdate := oldPred == "" || inRange(toID(args), toID(oldPred), node.ID)
+	if shouldUpdate {
 		node.predecessor = args
 		logrus.Infof("[%s] Updated predecessor to %s", node.Addr, args)
+	}
+	node.mu.Unlock()
+
+	// First-time predecessor assignment: pull precisely the keys in (pred, self]
+	// from the successor, and return any excess local keys.
+	if shouldUpdate && oldPred == "" {
+		node.mu.Lock()
+		succ := node.successorList[0]
+		node.mu.Unlock()
+
+		if succ != "" && succ != node.Addr {
+			// 1. Pull keys that hash into (predecessor, self] from successor.
+			var migrated map[string]string
+			r := Range{Start: toID(args), End: node.ID}
+			if err := node.RemoteCall(succ, "ChordNode.TransferKeys", r, &migrated); err == nil {
+				node.dataLock.Lock()
+				for k, v := range migrated {
+					node.data[k] = v
+				}
+				node.dataLock.Unlock()
+			}
+
+			// 2. Return local keys that do NOT belong to (predecessor, self].
+			node.dataLock.Lock()
+			var toReturn []Pair
+			for k, v := range node.data {
+				if !inRange(toID(k), toID(args), node.ID) {
+					toReturn = append(toReturn, Pair{Key: k, Value: v})
+				}
+			}
+			for _, p := range toReturn {
+				delete(node.data, p.Key)
+			}
+			node.dataLock.Unlock()
+
+			// Send excess keys back to the successor (RPC outside lock).
+			for _, p := range toReturn {
+				var dummy struct{}
+				node.RemoteCall(succ, "ChordNode.PutData", p, &dummy)
+			}
+		}
 	}
 	return nil
 }
@@ -439,7 +531,22 @@ func (node *ChordNode) FindSuccessor(id uint32, reply *string) error {
 	var nextReply string
 	err := node.RemoteCall(closest, "ChordNode.FindSuccessor", id, &nextReply)
 	if err != nil {
-		// RPC failed — fall back to self.
+		// closest is dead — try each live successor in order.
+		node.mu.Lock()
+		backups := node.successorList
+		node.mu.Unlock()
+		for _, s := range backups {
+			if s == "" || s == node.Addr || s == closest {
+				continue
+			}
+			err = node.RemoteCall(s, "ChordNode.FindSuccessor", id, &nextReply)
+			if err == nil {
+				break
+			}
+		}
+	}
+	if err != nil {
+		// All alternatives exhausted — return self as last resort.
 		*reply = node.Addr
 		return nil
 	}
@@ -520,6 +627,29 @@ func (node *ChordNode) Join(addr string) bool {
 	node.isActive = true
 	node.mu.Unlock()
 
+	// Conservative key migration: pull data from the successor that may now
+	// belong to this node. Keys that hash outside (self, successor] are
+	// potentially ours; the Notify RPC will later refine the range precisely.
+	var allData map[string]string
+	if err := node.RemoteCall(succAddr, "ChordNode.GetData", "", &allData); err == nil {
+		node.dataLock.Lock()
+		for k, v := range allData {
+			keyID := toID(k)
+			if !inRange(keyID, node.ID, toID(succAddr)) {
+				node.data[k] = v
+			}
+		}
+		node.dataLock.Unlock()
+
+		// Remove the transferred keys from the successor.
+		for k := range allData {
+			if _, ok := node.data[k]; ok {
+				var dummy struct{}
+				node.RemoteCall(succAddr, "ChordNode.DeleteData", k, &dummy)
+			}
+		}
+	}
+
 	logrus.Infof("[%s] Joined the Chord ring via %s, successor: %s", node.Addr, addr, succAddr)
 	return true
 }
@@ -534,6 +664,7 @@ func (node *ChordNode) Quit() {
 	logrus.Infof("[%s] Quitting the Chord ring", node.Addr)
 
 	succ := node.successorList[0]
+	pred := node.predecessor
 	node.isActive = false
 	node.mu.Unlock()
 
@@ -552,8 +683,15 @@ func (node *ChordNode) Quit() {
 		}
 	}
 
-	// Chord ring self-heals via stabilize; no explicit successor/predecessor
-	// notification is required by the paper.
+	// Notify predecessor to skip past us: its new successor is our successor.
+	if pred != "" && pred != node.Addr {
+		node.RemoteCall(pred, "ChordNode.UpdateSuccessor", succ, &struct{}{})
+	}
+
+	// Notify successor that its new predecessor is our predecessor.
+	if succ != "" && succ != node.Addr {
+		node.RemoteCall(succ, "ChordNode.UpdatePredecessor", pred, &struct{}{})
+	}
 
 	node.StopRPCServer()
 	logrus.Infof("[%s] Successfully quit the Chord ring", node.Addr)
