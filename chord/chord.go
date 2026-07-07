@@ -496,9 +496,42 @@ func (node *ChordNode) Create() {
 	logrus.Infof("[%s] Created a new Chord ring", node.Addr)
 }
 
-// force the current node to leave the ring
+// force the current node to leave the ring.
+// Unlike Quit(), this is an ungraceful departure, but we still make a
+// best-effort attempt to transfer data to the successor and notify
+// neighbors so the ring can recover more quickly.
 func (node *ChordNode) ForceQuit() {
 	logrus.Infof("[%s] Force quitting the Chord ring", node.Addr)
+
+	node.mu.Lock()
+	succ := node.successorList[0]
+	pred := node.predecessor
+	node.mu.Unlock()
+
+	// 1. Transfer all local data to the successor (best-effort).
+	if succ != "" && succ != node.Addr {
+		node.dataLock.RLock()
+		for k, v := range node.data {
+			var dummy struct{}
+			if err := node.RemoteCall(succ, "ChordNode.PutData", Pair{Key: k, Value: v}, &dummy); err != nil {
+				logrus.Errorf("[%s] ForceQuit: failed to transfer key %s to %s: %v", node.Addr, k, succ, err)
+			}
+		}
+		node.dataLock.RUnlock()
+	}
+
+	// 2. Notify predecessor to skip past us.
+	if pred != "" && pred != node.Addr {
+		var dummy struct{}
+		node.RemoteCall(pred, "ChordNode.UpdateSuccessor", succ, &dummy)
+	}
+
+	// 3. Notify successor about our predecessor.
+	if succ != "" && succ != node.Addr {
+		var dummy struct{}
+		node.RemoteCall(succ, "ChordNode.UpdatePredecessor", pred, &dummy)
+	}
+
 	node.StopRPCServer()
 }
 
@@ -542,6 +575,33 @@ func (node *ChordNode) FindSuccessor(id uint32, reply *string) error {
 			err = node.RemoteCall(s, "ChordNode.FindSuccessor", id, &nextReply)
 			if err == nil {
 				break
+			}
+		}
+
+		// If all successors failed, also try finger table entries.
+		if err != nil {
+			node.mu.Lock()
+			fingers := node.fingerTable
+			node.mu.Unlock()
+			for _, f := range fingers {
+				if f == "" || f == node.Addr || f == closest {
+					continue
+				}
+				// Skip entries already tried via successor list.
+				alreadyTried := false
+				for _, s := range backups {
+					if s == f {
+						alreadyTried = true
+						break
+					}
+				}
+				if alreadyTried {
+					continue
+				}
+				err = node.RemoteCall(f, "ChordNode.FindSuccessor", id, &nextReply)
+				if err == nil {
+					break
+				}
 			}
 		}
 	}
