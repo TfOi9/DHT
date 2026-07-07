@@ -1,6 +1,7 @@
 package chord
 
 import (
+	"fmt"
 	"hash/fnv"
 	"math/rand"
 	"net"
@@ -112,6 +113,42 @@ func (node *ChordNode) GetFingerTable(_ string, reply *[fingerTableSize]string) 
 	node.mu.Lock()
 	defer node.mu.Unlock()
 	*reply = node.fingerTable
+	return nil
+}
+
+// PutData stores a key-value pair on this node. Always succeeds (overwrites).
+func (node *ChordNode) PutData(pair Pair, _ *struct{}) error {
+	node.dataLock.Lock()
+	node.data[pair.Key] = pair.Value
+	node.dataLock.Unlock()
+	return nil
+}
+
+// GetValue retrieves the value for a single key from this node.
+// Returns an error when the key is not found.
+func (node *ChordNode) GetValue(key string, reply *string) error {
+	node.dataLock.RLock()
+	val, ok := node.data[key]
+	node.dataLock.RUnlock()
+	if !ok {
+		return fmt.Errorf("key not found: %s", key)
+	}
+	*reply = val
+	return nil
+}
+
+// DeleteData removes a key-value pair from this node.
+// Returns an error when the key is not found.
+func (node *ChordNode) DeleteData(key string, _ *struct{}) error {
+	node.dataLock.Lock()
+	_, ok := node.data[key]
+	if ok {
+		delete(node.data, key)
+	}
+	node.dataLock.Unlock()
+	if !ok {
+		return fmt.Errorf("key not found: %s", key)
+	}
 	return nil
 }
 
@@ -520,6 +557,67 @@ func (node *ChordNode) Quit() {
 
 	node.StopRPCServer()
 	logrus.Infof("[%s] Successfully quit the Chord ring", node.Addr)
+}
+
+// Put stores a key-value pair at the node responsible for the key.
+// Following the Chord paper: key k is stored at successor(k).
+func (node *ChordNode) Put(key string, value string) bool {
+	keyID := toID(key)
+	target := node.findSuccessor(keyID)
+
+	// Local storage — no RPC needed.
+	if target == node.Addr {
+		node.dataLock.Lock()
+		node.data[key] = value
+		node.dataLock.Unlock()
+		return true
+	}
+
+	err := node.RemoteCall(target, "ChordNode.PutData", Pair{Key: key, Value: value}, &struct{}{})
+	return err == nil
+}
+
+// Get retrieves the value for a key from the node responsible for it.
+// Following the Chord paper: looking up key k is to query successor(k).
+func (node *ChordNode) Get(key string) (bool, string) {
+	keyID := toID(key)
+	target := node.findSuccessor(keyID)
+
+	// Local lookup — no RPC needed.
+	if target == node.Addr {
+		node.dataLock.RLock()
+		val, ok := node.data[key]
+		node.dataLock.RUnlock()
+		return ok, val
+	}
+
+	var val string
+	err := node.RemoteCall(target, "ChordNode.GetValue", key, &val)
+	if err != nil {
+		return false, ""
+	}
+	return true, val
+}
+
+// Delete removes a key-value pair from the node responsible for the key.
+// Returns true if the key existed and was removed.
+func (node *ChordNode) Delete(key string) bool {
+	keyID := toID(key)
+	target := node.findSuccessor(keyID)
+
+	// Local deletion — no RPC needed.
+	if target == node.Addr {
+		node.dataLock.Lock()
+		_, ok := node.data[key]
+		if ok {
+			delete(node.data, key)
+		}
+		node.dataLock.Unlock()
+		return ok
+	}
+
+	err := node.RemoteCall(target, "ChordNode.DeleteData", key, &struct{}{})
+	return err == nil
 }
 
 // UpdateSuccessor inserts newSucc as the direct successor, shifting the
