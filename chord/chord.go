@@ -140,8 +140,63 @@ func (node *ChordNode) RemoteCall(addr, method string, args interface{}, reply i
 	return nil
 }
 
-// RunRPCServer starts the RPC server for the Chord node
-func (node *ChordNode) RunRPCServer(wg *sync.WaitGroup) {
+// StopRPCServer stops the RPC server for the Chord node
+func (node *ChordNode) StopRPCServer() {
+	node.online = false
+	node.listener.Close()
+	close(node.shutdown)
+}
+
+// wrapper function for the stabilization loop
+func (node *ChordNode) stabilizeLoop() {
+	ticker := time.NewTicker(stabilizationInterval)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ticker.C:
+			node.stabilize()
+		case <-node.shutdown:
+			return
+		}
+	}
+}
+
+// wrapper function for the fix finger loop
+func (node *ChordNode) fixFingerLoop() {
+	ticker := time.NewTicker(fixFingerInterval)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ticker.C:
+			node.fixFingers()
+		case <-node.shutdown:
+			return
+		}
+	}
+}
+
+// wrapper function for the check predecessor loop
+func (node *ChordNode) checkPredecessorLoop() {
+	ticker := time.NewTicker(checkPredInterval)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ticker.C:
+			node.checkPredecessor()
+		case <-node.shutdown:
+			return
+		}
+	}
+}
+
+// Run starts the main loop of the Chord node, handling stabilization, finger fixing, and predecessor checking
+func (node *ChordNode) Run(wg *sync.WaitGroup) {
+	node.online = true
+
+	// listen to RPC requests
 	node.server = rpc.NewServer()
 	node.server.Register(node)
 	var err error
@@ -150,6 +205,13 @@ func (node *ChordNode) RunRPCServer(wg *sync.WaitGroup) {
 	if err != nil {
 		logrus.Fatal("listen error: ", err)
 	}
+
+	// start loop tasks: stabilization, fix fingers, check predecessor
+	go node.stabilizeLoop()
+	go node.fixFingerLoop()
+	go node.checkPredecessorLoop()
+
+	// accept loop
 	for node.online {
 		conn, err := node.listener.Accept()
 		if err != nil {
@@ -160,19 +222,17 @@ func (node *ChordNode) RunRPCServer(wg *sync.WaitGroup) {
 	}
 }
 
-// StopRPCServer stops the RPC server for the Chord node
-func (node *ChordNode) StopRPCServer() {
-	node.online = false
-	node.listener.Close()
+// stabilize checks the node's successor and updates its predecessor and successor list accordingly
+func (node *ChordNode) stabilize() {
+	// TBD
 }
 
-// Run starts the main loop of the Chord node, handling stabilization, finger fixing, and predecessor checking
-func (node *ChordNode) Run(wg *sync.WaitGroup) {
-	// listen to RPC requests
+// fixFingers updates the node's finger table entries to ensure efficient lookups
+func (node *ChordNode) fixFingers() {
+	// TBD
+}
 
-	// start loop tasks: stabilization, fix fingers, check predecessor
-
-	// accept loop
-
+// checkPredecessor checks if the node's predecessor is still alive and updates it if necessary
+func (node *ChordNode) checkPredecessor() {
 	// TBD
 }
