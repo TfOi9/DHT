@@ -16,8 +16,8 @@ func basicTest() (bool, int, int) {
 	defer func() {
 		if r := recover(); r != nil {
 			testutil.Red.Println("Program panicked with", r)
+			panicked = true
 		}
-		panicked = true
 	}()
 
 	nodes := new([testutil.BasicTestNodeSize + 1]DhtNode)

@@ -18,8 +18,8 @@ func forceQuitTest() (bool, int, int) {
 	defer func() {
 		if r := recover(); r != nil {
 			testutil.Red.Println("Program panicked with", r)
+			panicked = true
 		}
-		panicked = true
 	}()
 
 	nodes := new([testutil.ForceQuitNodeSize + 1]DhtNode)
@@ -137,8 +137,8 @@ func quitAndStabilizeTest() (bool, int, int) {
 	defer func() {
 		if r := recover(); r != nil {
 			testutil.Red.Println("Program panicked with", r)
+			panicked = true
 		}
-		panicked = true
 	}()
 
 	nodes := new([testutil.QASNodeSize + 1]DhtNode)

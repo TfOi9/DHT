@@ -44,6 +44,21 @@ type KademliaNode struct {
 	republishMapLock sync.Mutex
 }
 
+// Initializes a new Kademlia node with the given address
+func (node *KademliaNode) Init(addr string) {
+	node.Addr = addr
+	node.NodeID = hash(addr)
+	node.data = make(map[string]string)
+	node.shutdown = make(chan struct{})
+	node.republishMap = make(map[string]time.Time)
+
+	for i := 0; i < KBucketCount; i++ {
+		node.buckets[i] = &KBucket{
+			contacts: []Contact{},
+		}
+	}
+}
+
 // Create a new Kademlia network
 func (node *KademliaNode) Create() {
 	node.mu.Lock()
@@ -67,10 +82,12 @@ func (node *KademliaNode) Run(wg *sync.WaitGroup) {
 
 	var err error
 	node.listener, err = net.Listen("tcp", node.Addr)
-	wg.Done()
 	if err != nil {
-		logrus.Fatalf("[%s] Failed to listen on %s: %v", node.Addr, node.Addr, err)
+		logrus.Errorf("[%s] Failed to listen on %s: %v", node.Addr, node.Addr, err)
+		wg.Done()
+		return
 	}
+	wg.Done()
 
 	go node.bucketRefreshLoop()
 
@@ -154,51 +171,71 @@ func (node *KademliaNode) Quit() {
 	node.isActive = false
 	node.mu.Unlock()
 
-	closest := node.findNode(node.NodeID)
-
-	if closest == nil || len(closest) == 0 {
-		logrus.Warnf("[%s] No closest node found. Data will be lost.", node.Addr)
-		node.stopRPCServer()
-		return
-	}
-
 	node.dataLock.RLock()
+	keys := make([]string, 0, len(node.data))
+	values := make([]string, 0, len(node.data))
 	for key, value := range node.data {
-		minDist := xorDistance(node.NodeID, closest[0].NodeID)
-		var targetNode Contact = closest[0]
-		for _, c := range closest {
-			dist := xorDistance(node.NodeID, c.NodeID)
-			if dist.Cmp(minDist) < 0 {
-				minDist = dist
-				targetNode = c
-			}
-		}
-
-		err := node.RemoteCall(targetNode.Addr, "KademliaNode.Store", &StoreArgs{Key: key, Value: value}, &struct{}{})
-		if err != nil {
-			logrus.Errorf("[%s] Failed to store data on %s: %v", node.Addr, targetNode.Addr, err)
-		} else {
-			logrus.Infof("[%s] Successfully stored data on %s", node.Addr, targetNode.Addr)
-		}
+		keys = append(keys, key)
+		values = append(values, value)
 	}
 	node.dataLock.RUnlock()
+
+	// Redistribute each key to Alpha closest LIVE nodes (from local routing table).
+	// Try up to K contacts but stop after Alpha successful stores to balance
+	// durability and performance.
+	for i := 0; i < len(keys); i++ {
+		keyID := hash(keys[i])
+		closest := node.findClosestContacts(keyID, K)
+		successCnt := 0
+		for _, c := range closest {
+			if c.Addr == node.Addr {
+				continue
+			}
+			err := node.RemoteCall(c.Addr, "KademliaNode.Store", &StoreArgs{Key: keys[i], Value: values[i]}, &struct{}{})
+			if err != nil {
+				logrus.Errorf("[%s] Failed to store data on %s: %v", node.Addr, c.Addr, err)
+			} else {
+				logrus.Infof("[%s] Successfully stored data on %s", node.Addr, c.Addr)
+				successCnt++
+				if successCnt >= Alpha {
+					break
+				}
+			}
+		}
+	}
+
+	node.stopRPCServer()
 }
 
 // Forces a node to quit
 func (node *KademliaNode) ForceQuit() {
-	closest := node.findClosestContacts(node.NodeID, K)
-	if len(closest) > 0 {
-		node.dataLock.RLock()
-		for key, value := range node.data {
-			err := node.RemoteCall(closest[0].Addr, "KademliaNode.Store", &StoreArgs{Key: key, Value: value}, &struct{}{})
+	node.dataLock.RLock()
+	keys := make([]string, 0, len(node.data))
+	values := make([]string, 0, len(node.data))
+	for key, value := range node.data {
+		keys = append(keys, key)
+		values = append(values, value)
+	}
+	node.dataLock.RUnlock()
+
+	// Redistribute each key to the K closest nodes (from local routing table).
+	// Using K replicas improves data durability during cascading force-quits.
+	for i := 0; i < len(keys); i++ {
+		keyID := hash(keys[i])
+		closest := node.findClosestContacts(keyID, K)
+		for _, c := range closest {
+			if c.Addr == node.Addr {
+				continue
+			}
+			err := node.RemoteCall(c.Addr, "KademliaNode.Store", &StoreArgs{Key: keys[i], Value: values[i]}, &struct{}{})
 			if err != nil {
-				logrus.Errorf("[%s] Failed to store data on %s: %v", node.Addr, closest[0].Addr, err)
+				logrus.Errorf("[%s] Failed to store data on %s: %v", node.Addr, c.Addr, err)
 			} else {
-				logrus.Infof("[%s] Successfully stored data on %s", node.Addr, closest[0].Addr)
+				logrus.Infof("[%s] Successfully stored data on %s", node.Addr, c.Addr)
 			}
 		}
-		node.dataLock.RUnlock()
 	}
+
 	node.mu.Lock()
 	node.isActive = false
 	node.mu.Unlock()

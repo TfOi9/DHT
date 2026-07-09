@@ -95,10 +95,6 @@ func (node *KademliaNode) findClosestContacts(target [IDLength]byte, count int) 
 			bucket.mu.Lock()
 			allContacts = append(allContacts, bucket.contacts...)
 			bucket.mu.Unlock()
-
-			if len(allContacts) >= count {
-				break
-			}
 		}
 	}
 
@@ -144,7 +140,8 @@ func (node *KademliaNode) insertContact(contact Contact) {
 	head := bucket.contacts[0]
 	bucket.mu.Unlock()
 
-	err := node.RemoteCall(head.Addr, "KademliaNode.Ping", "", &struct{}{})
+	// Use rawCall to avoid cascading Introduce → insertContact → Ping chains.
+	err := node.rawCall(head.Addr, "KademliaNode.Ping", "", &struct{}{})
 	if err != nil {
 		bucket.mu.Lock()
 		bucket.contacts = bucket.contacts[1:]
@@ -164,6 +161,29 @@ func (node *KademliaNode) updateRoutingTable(addr string) {
 		LastSeen: time.Now(),
 	}
 	node.insertContact(contact)
+}
+
+// removeContact evicts a dead contact from the routing table.
+func (node *KademliaNode) removeContact(addr string) {
+	nodeID := hash(addr)
+	idx := bucketIndex(node.NodeID, nodeID)
+	if idx < 0 || idx >= KBucketCount {
+		return
+	}
+
+	node.bucketsLock.RLock()
+	bucket := node.buckets[idx]
+	node.bucketsLock.RUnlock()
+
+	bucket.mu.Lock()
+	defer bucket.mu.Unlock()
+
+	for i, c := range bucket.contacts {
+		if c.Addr == addr {
+			bucket.contacts = append(bucket.contacts[:i], bucket.contacts[i+1:]...)
+			return
+		}
+	}
 }
 
 // Fetch the alpha-closest contacts to the target that are not visited
@@ -248,8 +268,10 @@ func (node *KademliaNode) findNode(target [IDLength]byte) []Contact {
 			break
 		}
 
-		// Query each candidate in parallel
+		// Query each candidate in parallel, tracking failures
 		resultsCh := make(chan []Contact, len(candidates))
+		var failedMu sync.Mutex
+		failedAddrs := make(map[string]bool)
 		var wg sync.WaitGroup
 		for _, c := range candidates {
 			queried[c.Addr] = true
@@ -262,12 +284,27 @@ func (node *KademliaNode) findNode(target [IDLength]byte) []Contact {
 					resultsCh <- reply
 				} else {
 					resultsCh <- nil
+					failedMu.Lock()
+					failedAddrs[contact.Addr] = true
+					failedMu.Unlock()
 				}
 			}(c)
 		}
 
 		wg.Wait()
 		close(resultsCh)
+
+		// Remove dead contacts from the shortlist so they don't
+		// cause isLimitReached to stop the search prematurely.
+		if len(failedAddrs) > 0 {
+			alive := make([]Contact, 0, len(shortlist))
+			for _, c := range shortlist {
+				if !failedAddrs[c.Addr] {
+					alive = append(alive, c)
+				}
+			}
+			shortlist = alive
+		}
 
 		for result := range resultsCh {
 			for _, c := range result {

@@ -3,7 +3,6 @@ package kademlia
 import (
 	"net"
 	"net/rpc"
-	"time"
 
 	"github.com/sirupsen/logrus"
 )
@@ -29,7 +28,7 @@ func (node *KademliaNode) Store(args *StoreArgs, _ *struct{}) error {
 
 // FIND_NODE RPC method for retrieving data from the DHT.
 func (node *KademliaNode) FindNode(args *[IDLength]byte, reply *[]Contact) error {
-	*reply = node.findNode(*args)
+	*reply = node.findClosestContacts(*args, K)
 	return nil
 }
 
@@ -51,7 +50,7 @@ func (node *KademliaNode) FindValue(key string, reply *FindValueReply) error {
 		reply.Found = true
 	} else {
 		hashKey := hash(key)
-		reply.Contacts = node.findNode(hashKey)
+		reply.Contacts = node.findClosestContacts(hashKey, K)
 		reply.Found = false
 	}
 	return nil
@@ -59,12 +58,13 @@ func (node *KademliaNode) FindValue(key string, reply *FindValueReply) error {
 
 // RemoteCall performs an RPC call to a remote node.
 func (node *KademliaNode) RemoteCall(addr, method string, args interface{}, reply interface{}) error {
-	if method != "KademliaNode.Ping" {
+	if method != "KademliaNode.Ping" && method != "KademliaNode.Introduce" {
 		logrus.Infof("[%s] RemoteCall %s %s", node.Addr, addr, method)
 	}
 	conn, err := net.DialTimeout("tcp", addr, RPCTimeout)
 	if err != nil {
 		logrus.Error("dialing: ", err)
+		node.removeContact(addr)
 		return err
 	}
 	client := rpc.NewClient(conn)
@@ -77,22 +77,55 @@ func (node *KademliaNode) RemoteCall(addr, method string, args interface{}, repl
 
 	// Update the routing table with gathered info about the node
 	node.updateRoutingTable(addr)
+
+	// Introduce ourselves to the remote node so it also learns about us.
+	// Best-effort; ignore failure.
+	client.Call("KademliaNode.Introduce", node.Addr, &struct{}{})
+	return nil
+}
+
+// rawCall performs an RPC call WITHOUT the Introduce step, to avoid
+// cascading routing-table updates from internal liveness checks.
+// It does NOT evict contacts on failure — the caller (e.g. insertContact)
+// is responsible for handling unresponsive contacts.
+func (node *KademliaNode) rawCall(addr, method string, args interface{}, reply interface{}) error {
+	conn, err := net.DialTimeout("tcp", addr, RPCTimeout)
+	if err != nil {
+		return err
+	}
+	client := rpc.NewClient(conn)
+	defer client.Close()
+	return client.Call(method, args, reply)
+}
+
+// INTRODUCE RPC: lets the receiver learn the caller's Kademlia address.
+func (node *KademliaNode) Introduce(callerAddr string, _ *struct{}) error {
+	node.updateRoutingTable(callerAddr)
 	return nil
 }
 
 // Additional RPC: GET_ALL_DATA
-func (node *KademliaNode) GetAllData(_ string, reply *[]Contact) error {
+func (node *KademliaNode) GetAllData(_ string, reply *map[string]string) error {
 	node.dataLock.RLock()
 	defer node.dataLock.RUnlock()
 
-	*reply = []Contact{}
-	for key, _ := range node.data {
-		contact := Contact{
-			NodeID:   hash(key),
-			Addr:     node.Addr,
-			LastSeen: time.Now(),
-		}
-		*reply = append(*reply, contact)
+	*reply = make(map[string]string)
+	for key, value := range node.data {
+		(*reply)[key] = value
+	}
+	return nil
+}
+
+// Additional RPC: DELETE_DATA
+func (node *KademliaNode) DeleteData(key string, reply *bool) error {
+	node.dataLock.Lock()
+	defer node.dataLock.Unlock()
+
+	if _, exists := node.data[key]; exists {
+		delete(node.data, key)
+		*reply = true
+	} else {
+		*reply = false
 	}
 	return nil
 }
