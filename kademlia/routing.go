@@ -1,6 +1,7 @@
 package kademlia
 
 import (
+	"crypto/rand"
 	"crypto/sha1"
 	"math/big"
 	"sort"
@@ -51,7 +52,7 @@ func (bucket *KBucket) updateContact(contact Contact) {
 
 	for i, c := range bucket.contacts {
 		if c.NodeID == contact.NodeID {
-			// contact.LastSeen = time.Now()
+			contact.LastSeen = time.Now()
 			bucket.contacts = append(bucket.contacts[:i], bucket.contacts[i+1:]...)
 			bucket.contacts = append(bucket.contacts, contact)
 			return
@@ -106,6 +107,9 @@ func (node *KademliaNode) findClosestContacts(target [IDLength]byte, count int) 
 			xorDistance(allContacts[j].NodeID, target)) < 0
 	})
 
+	if count > len(allContacts) {
+		return allContacts
+	}
 	return allContacts[:count]
 }
 
@@ -283,4 +287,64 @@ func (node *KademliaNode) findNode(target [IDLength]byte) []Contact {
 		shortlist = shortlist[:K]
 	}
 	return shortlist
+}
+
+// Refresh a specific k-bucket by randomly selecting a target ID within range
+func (node *KademliaNode) refreshKBucket(bucketIndex int) {
+	node.bucketsLock.RLock()
+	bucket := node.buckets[bucketIndex]
+	node.bucketsLock.RUnlock()
+
+	if bucket == nil {
+		return
+	}
+
+	target := generateRandomID(node.NodeID, bucketIndex)
+	contacts := node.findNode(target)
+	for _, c := range contacts {
+		node.insertContact(c)
+	}
+}
+
+// Generate a random ID that falls within the range of the specified k-bucket.
+// Bucket i covers XOR distances in [2^i, 2^(i+1) - 1].
+// The random ID is produced by XOR-ing the local node's ID with a random
+// distance drawn uniformly from that interval.
+func generateRandomID(nodeID [IDLength]byte, bucketIndex int) [IDLength]byte {
+	minDist := new(big.Int).Lsh(big.NewInt(1), uint(bucketIndex))
+	maxDist := new(big.Int).Sub(new(big.Int).Lsh(big.NewInt(1), uint(bucketIndex+1)), big.NewInt(1))
+
+	rangeSize := new(big.Int).Sub(maxDist, minDist)
+	rangeSize.Add(rangeSize, big.NewInt(1))
+
+	d, err := rand.Int(rand.Reader, rangeSize)
+	if err != nil {
+		return [IDLength]byte{}
+	}
+	d.Add(d, minDist)
+
+	dBytes := d.Bytes()
+	var target [IDLength]byte
+	copy(target[IDLength-len(dBytes):], dBytes)
+	for i := 0; i < IDLength; i++ {
+		target[i] ^= nodeID[i]
+	}
+	return target
+}
+
+// Refresh all k-buckets periodically
+func (node *KademliaNode) bucketRefreshLoop() {
+	ticker := time.NewTicker(RefreshInterval)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ticker.C:
+			for i := 0; i < KBucketCount; i++ {
+				node.refreshKBucket(i)
+			}
+		case <-node.shutdown:
+			return
+		}
+	}
 }

@@ -3,6 +3,7 @@ package kademlia
 import (
 	"net"
 	"net/rpc"
+	"time"
 
 	"github.com/sirupsen/logrus"
 )
@@ -77,4 +78,30 @@ func (node *KademliaNode) RemoteCall(addr, method string, args interface{}, repl
 	// Update the routing table with gathered info about the node
 	node.updateRoutingTable(addr)
 	return nil
+}
+
+// Additional RPC: GET_ALL_DATA
+func (node *KademliaNode) GetAllData(_ string, reply *[]Contact) error {
+	node.dataLock.RLock()
+	defer node.dataLock.RUnlock()
+
+	*reply = []Contact{}
+	for key, _ := range node.data {
+		contact := Contact{
+			NodeID:   hash(key),
+			Addr:     node.Addr,
+			LastSeen: time.Now(),
+		}
+		*reply = append(*reply, contact)
+	}
+	return nil
+}
+
+// Stops an RPC server gracefully
+func (node *KademliaNode) stopRPCServer() {
+	node.online = false
+	close(node.shutdown)
+	if node.listener != nil {
+		node.listener.Close()
+	}
 }
