@@ -160,24 +160,53 @@ func (node *KademliaNode) cacheValue(key, value string, keyID [IDLength]byte) {
 	}
 }
 
-// Delete removes a key-value pair from the DHT
+// Delete removes a key-value pair from the DHT.
+// It deletes the key from the local node (if present) and from the K closest
+// remote nodes. Returns true if at least one replica confirmed deletion.
 func (node *KademliaNode) Delete(key string) bool {
 	logrus.Infof("[%s] Deleting key: %s", node.Addr, key)
 
 	keyID := hash(key)
+
+	localDeleted := false
+	node.dataLock.Lock()
+	if _, exists := node.data[key]; exists {
+		delete(node.data, key)
+		localDeleted = true
+	}
+	node.dataLock.Unlock()
+
 	closest := node.findNode(keyID)
 
-	successCount := 0
-	for _, c := range closest {
-		var reply struct{}
-		err := node.RemoteCall(c.Addr, "KademliaNode.Delete", key, &reply)
-		if err != nil {
-			logrus.Errorf("[%s] Failed to delete key on %s: %v", node.Addr, c.Addr, err)
-		} else {
-			logrus.Infof("[%s] Successfully deleted key on %s", node.Addr, c.Addr)
-			successCount++
-		}
-	}
+	remoteDeleted := false
+	var mu sync.Mutex
+	var wg sync.WaitGroup
 
-	return successCount > 0
+	for _, c := range closest {
+		if c.Addr == node.Addr {
+			continue // already handled locally
+		}
+		wg.Add(1)
+		go func(contact Contact) {
+			defer wg.Done()
+			var deleted bool
+			err := node.RemoteCall(contact.Addr,
+				"KademliaNode.DeleteData", key, &deleted)
+			if err != nil {
+				logrus.Errorf("[%s] Failed to delete key on %s: %v",
+					node.Addr, contact.Addr, err)
+				return
+			}
+			if deleted {
+				logrus.Infof("[%s] Successfully deleted key on %s",
+					node.Addr, contact.Addr)
+				mu.Lock()
+				remoteDeleted = true
+				mu.Unlock()
+			}
+		}(c)
+	}
+	wg.Wait()
+
+	return localDeleted || remoteDeleted
 }
