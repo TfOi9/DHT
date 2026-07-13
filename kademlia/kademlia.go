@@ -209,35 +209,7 @@ func (node *KademliaNode) Quit() {
 
 // Forces a node to quit
 func (node *KademliaNode) ForceQuit() {
-	node.dataLock.RLock()
-	keys := make([]string, 0, len(node.data))
-	values := make([]string, 0, len(node.data))
-	for key, value := range node.data {
-		keys = append(keys, key)
-		values = append(values, value)
-	}
-	node.dataLock.RUnlock()
+	// Do nothing.
 
-	// Redistribute each key to the K closest nodes (from local routing table).
-	// Using K replicas improves data durability during cascading force-quits.
-	for i := 0; i < len(keys); i++ {
-		keyID := hash(keys[i])
-		closest := node.findClosestContacts(keyID, K)
-		for _, c := range closest {
-			if c.Addr == node.Addr {
-				continue
-			}
-			err := node.RemoteCall(c.Addr, "KademliaNode.Store", &StoreArgs{Key: keys[i], Value: values[i]}, &struct{}{})
-			if err != nil {
-				logrus.Errorf("[%s] Failed to store data on %s: %v", node.Addr, c.Addr, err)
-			} else {
-				logrus.Infof("[%s] Successfully stored data on %s", node.Addr, c.Addr)
-			}
-		}
-	}
-
-	node.mu.Lock()
-	node.isActive = false
-	node.mu.Unlock()
 	node.stopRPCServer()
 }
