@@ -1,9 +1,11 @@
 package node
 
-import "dht/kademlia"
+import (
+	"dht/chord"
+)
 
 func NewNode(port int) DhtNode {
-	node := new(kademlia.KademliaNode)
+	node := new(chord.ChordNode)
 	node.Init(portToAddr(localAddress, port))
 	return node
 }
