@@ -187,8 +187,9 @@ func (node *ChordNode) Get(key string) (bool, string) {
 	var val string
 	err := node.RemoteCall(target, "ChordNode.GetValue", key, &val)
 	if err != nil {
-		// The primary node doesn't have the key.  Try the successor, whose
-		// replica store should contain a copy (propagated by stabilize).
+		// The primary node doesn't have the key (or is dead).
+		// First, try the original fallback: ask the target for its
+		// successor list; the successor should hold a replica.
 		var succList [successorListSize]string
 		if e := node.RemoteCall(target, "ChordNode.GetSuccessorList", "", &succList); e == nil {
 			succ := succList[0]
@@ -196,6 +197,27 @@ func (node *ChordNode) Get(key string) (bool, string) {
 				if e2 := node.RemoteCall(succ, "ChordNode.GetReplica", key, &val); e2 == nil {
 					return true, val
 				}
+			}
+			return false, ""
+		}
+
+		// The target is dead (both GetValue and GetSuccessorList failed).
+		// Walk our own successor list — the dead target's immediate
+		// successor (our successor[1]) should hold a replica propagated
+		// by stabilize, and GetValue on any live successor checks both
+		// primary data and replica storage.
+		node.mu.Lock()
+		mySuccList := node.successorList
+		node.mu.Unlock()
+		for _, succ := range mySuccList {
+			if succ == "" || succ == node.Addr || succ == target {
+				continue
+			}
+			if e := node.RemoteCall(succ, "ChordNode.GetValue", key, &val); e == nil {
+				return true, val
+			}
+			if e := node.RemoteCall(succ, "ChordNode.GetReplica", key, &val); e == nil {
+				return true, val
 			}
 		}
 		return false, ""

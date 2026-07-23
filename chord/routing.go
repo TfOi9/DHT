@@ -167,9 +167,16 @@ func (node *ChordNode) fixFingers() {
 	fingerID := node.ID + (1 << i)
 	addr := node.findSuccessor(fingerID)
 
+	// If findSuccessor returned self and we have no successors, the node is
+	// isolated — keep the old finger entry (which may still point to a live
+	// node) instead of blindly overwriting it with self.
 	node.mu.Lock()
-	node.fingerTable[i] = addr
-	node.mu.Unlock()
+	if addr == node.Addr && node.successorList[0] == "" {
+		node.mu.Unlock()
+	} else {
+		node.fingerTable[i] = addr
+		node.mu.Unlock()
+	}
 
 	// Also refresh the successor list from the current successor.
 	node.mu.Lock()
@@ -229,6 +236,22 @@ func (node *ChordNode) FindSuccessor(id uint32, reply *string) error {
 
 	// Not part of any ring yet — return self as the only available node.
 	if succ == "" {
+		// The successor list is empty (all known successors are dead).
+		// Before giving up, try the finger table — it may still contain
+		// entries pointing to live nodes that can help route the query.
+		node.mu.Lock()
+		fingers := node.fingerTable
+		node.mu.Unlock()
+		for _, f := range fingers {
+			if f == "" || f == node.Addr {
+				continue
+			}
+			var nextReply string
+			if err := node.RemoteCall(f, "ChordNode.FindSuccessor", id, &nextReply); err == nil {
+				*reply = nextReply
+				return nil
+			}
+		}
 		*reply = node.Addr
 		return nil
 	}

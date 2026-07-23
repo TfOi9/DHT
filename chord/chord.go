@@ -11,11 +11,11 @@ import (
 
 const (
 	fingerTableSize       = 32                     // Size of the finger table (2^m, where m is the number of bits in the ID space)
-	successorListSize     = 12                     // Size of the successor list for fault tolerance
+	successorListSize     = 24                     // Size of the successor list for fault tolerance
 	rpcTimeout            = 10 * time.Second       // Timeout for RPC calls
-	stabilizationInterval = 500 * time.Millisecond // Interval for stabilization routine
-	fixFingerInterval     = 1 * time.Second        // Interval for fixing finger table entries
-	checkPredInterval     = 1 * time.Second        // Interval for checking predecessor liveness
+	stabilizationInterval = 200 * time.Millisecond // Interval for stabilization routine
+	fixFingerInterval     = 500 * time.Millisecond // Interval for fixing finger table entries
+	checkPredInterval     = 500 * time.Millisecond // Interval for checking predecessor liveness
 )
 
 type ChordNode struct {
