@@ -1,3 +1,7 @@
 dht
 *.log
 temp/
+presentation.*
+!presentation.pdf
+.DS_Store
+outline.md
